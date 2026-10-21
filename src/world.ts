@@ -56,6 +56,14 @@ const JS_VALUE_MAX = 30000;
 const CHANGES_MAX = 12;
 /** 等就绪的轮询间隔。 */
 const READY_POLL_MS = 1000;
+/**
+ * 已就绪之后的复检间隔。连接可能在两次调用之间静默失效：半开 socket 不会发 close 事件，
+ * 上游 `/health` 仍然报 `connected: true`。30 秒内最多复检一次，正常路径上只是一个
+ * 时间戳比较，不给每次工具调用加一次 HTTP 往返。
+ */
+const READY_RECHECK_MS = 30_000;
+/** 复检用的探活超时：比普通调用短，别让"确认它已经死了"本身又拖 30 秒。 */
+const READY_RECHECK_TIMEOUT_MS = 8000;
 /** `find-url.mjs` 跑一次的上限：它要开本机的 sqlite 历史库。 */
 const FIND_URL_TIMEOUT_MS = 20000;
 /**
@@ -77,6 +85,11 @@ const NAV_FAILED_DUMP_MS = 5000;
 const NAV_UNANSWERED_HINT =
   '（proxy 与浏览器都是通的：多半是那个地址在这台机器上打不开、或者页面太慢。' +
   '先确认这个站点连得上，或换个地址再试——不是浏览器坏了。）';
+
+/** 「连上了但不答」时补给人看的一句：这跟远程调试开关无关。 */
+const RELAY_HALF_DEAD_HINT =
+  '（代理与浏览器都还在，是连接层不再应答——不是远程调试开关的问题。' +
+  '下一次调用会尝试重新连接；仍然不行就重启 cdp-proxy，再不行重启 Coopanion。）';
 
 /** 这一类失败（命令发出去没回话）要说的话。 */
 const COMMAND_TIMEOUT_HINT =
@@ -426,6 +439,8 @@ export class BrowserWorld implements World {
   private seenAt = 0;
   /** proxy 掉了之后补拉过一次就不再试了。 */
   private recoveryTried = false;
+  /** 上一次 ready 复检的时刻；0 表示还没复检过。 */
+  private readyProbedAt = 0;
 
   private readonly searchService: BrowserSearchService;
 
@@ -740,6 +755,10 @@ export class BrowserWorld implements World {
   }
 
   private connectHint(): string {
+    if (/CDP 命令超时|不回话|连接.*失效/.test(this.lastError)) {
+      return '（这不是调试开关的问题：连接曾经建立过，是浏览器那一侧不再应答。' +
+        '先按「连接层半死」处理：重启 cdp-proxy，仍然不行再重启 Coopanion。）';
+    }
     if (/端口/.test(this.lastError)) {
       return '（换一个没被占用的 worlds.browser.port：Windows 保留的端口段会报 EACCES。）';
     }
@@ -870,7 +889,16 @@ export class BrowserWorld implements World {
    */
   private async ensureReady(): Promise<string | null> {
     this.sweepIdle(); // 顺手把她闲置的窗口收掉（不挂定时器）；注意要在"已就绪就早退"之前
-    if (this.state === 'ready') return null;
+    if (this.state === 'ready') {
+      // 已就绪 ≠ 还活着。连接层没有心跳（上游 send 超时只 reject、不改状态），
+      // 半开的 socket 会让 /health 一直报 connected。这里带缓存复检一次，失败就退回 failed，
+      // 让下面那条补拉路径（以及下一次调用的重连）有机会真正跑起来。
+      if (Date.now() - this.readyProbedAt < READY_RECHECK_MS) return null;
+      this.readyProbedAt = Date.now();
+      if (await this.relay.reachable(Math.min(READY_RECHECK_TIMEOUT_MS, this.timeout()))) return null;
+      this.state = 'failed';
+      this.lastError = '连接在上一次调用之后失效了（浏览器不再应答）';
+    }
     const settle = async (): Promise<string | null> => {
       const wrong = await this.ownTargetProblem();
       if (wrong) {
@@ -880,6 +908,10 @@ export class BrowserWorld implements World {
       }
       this.state = 'ready';
       this.lastError = '';
+      this.readyProbedAt = Date.now();
+      // 恢复成功就把"本场只补拉一次"的额度还回去：下次再断还能再试一次，
+      // 不至于一次失败之后整场都失去补拉能力。
+      this.recoveryTried = false;
       return null;
     };
     if (await this.relay.reachable(this.timeout())) return settle();
@@ -916,15 +948,35 @@ export class BrowserWorld implements World {
     return defs.map((def) => ({
       ...def,
       handler: async (args, ctx) => {
-        const target = str(args.target);
-        if (target) this.touch(target);
-        if (target && (def.name === 'browser_navigate' || def.name === 'browser_close')) {
-          if (def.name === 'browser_close' && !this.mine.has(target)) return def.handler(args, ctx);
-          return this.video.mutateTarget(target, () => def.handler(args, ctx));
+        try {
+          const target = str(args.target);
+          if (target) this.touch(target);
+          if (target && (def.name === 'browser_navigate' || def.name === 'browser_close')) {
+            if (def.name === 'browser_close' && !this.mine.has(target)) return await def.handler(args, ctx);
+            return await this.video.mutateTarget(target, () => def.handler(args, ctx));
+          }
+          return await def.handler(args, ctx);
+        } catch (err) {
+          throw this.noteRelayFailure(err) ?? err;
         }
-        return def.handler(args, ctx);
       },
     }));
+  }
+
+  /**
+   * 把「连上了但不答」记成 failed，并给回执补一句人话。
+   *
+   * 上游 `send()` 超时只 reject 那一条命令、不改连接状态，所以这里看到的是
+   * 「每次调用都卡 30 秒然后报 CDP 命令超时」，而 `state` 仍然是 ready。
+   * 不在这里降级，`ensureReady()` 下次还会把它当成就绪，永远走不到补拉那一步。
+   * 返回替换后的错误（调用方 throw 它）；不是这一类失败就返回 null。
+   */
+  private noteRelayFailure(err: unknown): Error | null {
+    if (!(err instanceof RelayError)) return null;
+    if (!/CDP 命令超时/.test(err.message)) return null;
+    this.state = 'failed';
+    this.lastError = `浏览器连着但不回话（${err.message}）`;
+    return new RelayError(`${err.message}${RELAY_HALF_DEAD_HINT}`, err.status);
   }
 
   private openTool(): ToolDef {
